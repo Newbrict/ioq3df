@@ -35,5 +35,13 @@ include("${CMAKELIST_DIR}/include/internal_masm.cmake")
 
 set(TRY_MASM_TARGET "try_client_masm")
 
+if(MSVC)
+	#Image Has Safe Exception Handlers, is no longer default no in msvc 2013, /SAFESEH:NO
+	list(APPEND TRY_MASM_LDFLAGS "/SAFESEH:NO")
+endif(MSVC)
+
 add_executable("${TRY_MASM_TARGET}" "${CMAKELIST_DIR}/include/try_asm.c")
 target_link_libraries("${TRY_MASM_TARGET}" "${MASM_TARGET}")
+
+string(REPLACE ";" " " TRY_MASM_LDFLAGS_STRING "${TRY_MASM_LDFLAGS}")
+set_target_properties("${TRY_MASM_TARGET}" PROPERTIES LINK_FLAGS "${TRY_MASM_LDFLAGS_STRING}")
