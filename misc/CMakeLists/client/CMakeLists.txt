@@ -335,6 +335,13 @@ if(MSVC)
 			"${LIBS_DIR}/win${BITS}/SDL2main.lib"
 		)
 		set(SDL_FOUND TRUE)
+
+		foreach(FILEPATH ${SDL_LIBRARIES})
+			if(NOT EXISTS "${FILEPATH}")
+				get_filename_component(FILE "${FILEPATH}" NAME)
+				message(WARNING "Did not find ${FILE} for MSVC, asuming: ${FILEPATH}\n")
+			endif()
+		endforeach(FILEPATH)
 	endif()
 
 	if(NOT USE_CURL_DLOPEN)
@@ -346,6 +353,13 @@ if(MSVC)
 				list(APPEND CURL_LIBRARIES "${LIBS_DIR}/win32/curl.lib")
 			endif()
 			set(CURL_FOUND TRUE)
+
+			foreach(FILEPATH ${CURL_LIBRARIES})
+				if(NOT EXISTS "${FILEPATH}")
+					get_filename_component(FILE "${FILEPATH}" NAME)
+					message(WARNING "Did not find ${FILE} for MSVC, asuming: ${FILEPATH}\n")
+				endif()
+			endforeach(FILEPATH)
 		endif(USE_LOCAL_HEADERS)
 	endif(NOT USE_CURL_DLOPEN)
 
