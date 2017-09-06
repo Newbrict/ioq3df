@@ -27,24 +27,33 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 // A user mod should never modify this file
 
 #ifdef STANDALONE
-  #define PRODUCT_NAME			"iofoo3"
-  #define BASEGAME			"foobar"
-  #define CLIENT_WINDOW_TITLE     	"changeme"
-  #define CLIENT_WINDOW_MIN_TITLE 	"changeme2"
+  #define PRODUCT_NAME				"iofoo3"
+  #define BASEGAME					"foobar"
+  #define CLIENT_WINDOW_TITLE		"changeme"
+  #define CLIENT_WINDOW_MIN_TITLE	"changeme2"
   #define HOMEPATH_NAME_UNIX		".foo"
-  #define HOMEPATH_NAME_WIN		"FooBar"
+  #define HOMEPATH_NAME_WIN			"FooBar"
   #define HOMEPATH_NAME_MACOSX		HOMEPATH_NAME_WIN
+//  #define STEAMPATH_NAME			"Foo Bar"
+//  #define STEAMPATH_APPID         ""
   #define GAMENAME_FOR_MASTER		"foobar"	// must NOT contain whitespace
+  #define CINEMATICS_LOGO		"foologo.roq"
+  #define CINEMATICS_INTRO		"intro.roq"
 //  #define LEGACY_PROTOCOL	// You probably don't need this for your standalone game
 #else
   #define PRODUCT_NAME			"ioq3df"
   #define BASEGAME			"baseq3"
-  #define CLIENT_WINDOW_TITLE     	"ioq3df"
+  #define CLIENT_WINDOW_TITLE     	"ioquake3df"
   #define CLIENT_WINDOW_MIN_TITLE 	"ioq3df"
   #define HOMEPATH_NAME_UNIX		".q3a"
-  #define HOMEPATH_NAME_WIN		"Quake3"
+  #define HOMEPATH_NAME_WIN			"Quake3"
   #define HOMEPATH_NAME_MACOSX		HOMEPATH_NAME_WIN
+  #define STEAMPATH_NAME			"Quake 3 Arena"
+  #define STEAMPATH_APPID			"2200"
+  #define GOGPATH_ID				"1441704920"
   #define GAMENAME_FOR_MASTER		"Quake3Arena"
+  #define CINEMATICS_LOGO		"idlogo.RoQ"
+  #define CINEMATICS_INTRO		"intro.RoQ"
   #define LEGACY_PROTOCOL
 #endif
 
@@ -60,6 +69,10 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 #ifndef PRODUCT_VERSION
   #define PRODUCT_VERSION "1.0"
+#endif
+
+#ifndef PRODUCT_DATE
+#  define PRODUCT_DATE __DATE__
 #endif
 
 #define Q3_VERSION PRODUCT_NAME " " PRODUCT_VERSION
@@ -928,6 +941,7 @@ struct cvar_s {
 	qboolean	integral;
 	float			min;
 	float			max;
+	char			*description;
 
 	cvar_t *next;
 	cvar_t *prev;

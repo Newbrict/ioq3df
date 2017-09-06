@@ -38,6 +38,7 @@ unsigned int mouse_button_click_y;
 
 static cvar_t *in_keyboardDebug     = NULL;
 
+static SDL_GameController *gamepad = NULL;
 static SDL_Joystick *stick = NULL;
 
 static qboolean mouseAvailable = qfalse;
@@ -52,6 +53,8 @@ static cvar_t *in_joystickNo        = NULL;
 static cvar_t *in_joystickUseAnalog = NULL;
 
 static int vidRestartTime = 0;
+
+static int in_eventTime = 0;
 
 static SDL_Window *SDL_window = NULL;
 
@@ -194,7 +197,18 @@ static keyNum_t IN_TranslateSDLToQ3Key( SDL_Keysym *keysym, qboolean down )
 {
 	keyNum_t key = 0;
 
-	if( keysym->sym >= SDLK_SPACE && keysym->sym < SDLK_DELETE )
+	if( keysym->scancode >= SDL_SCANCODE_1 && keysym->scancode <= SDL_SCANCODE_0 )
+	{
+		// Always map the number keys as such even if they actually map
+		// to other characters (eg, "1" is "&" on an AZERTY keyboard).
+		// This is required for SDL before 2.0.6, except on Windows
+		// which already had this behavior.
+		if( keysym->scancode == SDL_SCANCODE_0 )
+			key = '0';
+		else
+			key = '1' + keysym->scancode - SDL_SCANCODE_1;
+	}
+	else if( keysym->sym >= SDLK_SPACE && keysym->sym < SDLK_DELETE )
 	{
 		// These happen to match the ASCII chars
 		key = (int)keysym->sym;
@@ -250,8 +264,13 @@ static keyNum_t IN_TranslateSDLToQ3Key( SDL_Keysym *keysym, qboolean down )
 			case SDLK_LCTRL:
 			case SDLK_RCTRL:        key = K_CTRL;          break;
 
+#ifdef __APPLE__
 			case SDLK_RGUI:
 			case SDLK_LGUI:         key = K_COMMAND;       break;
+#else
+			case SDLK_RGUI:
+			case SDLK_LGUI:         key = K_SUPER;         break;
+#endif
 
 			case SDLK_RALT:
 			case SDLK_LALT:         key = K_ALT;           break;
@@ -269,6 +288,7 @@ static keyNum_t IN_TranslateSDLToQ3Key( SDL_Keysym *keysym, qboolean down )
 			case SDLK_PRINTSCREEN:  key = K_PRINT;         break;
 			case SDLK_SYSREQ:       key = K_SYSREQ;        break;
 			case SDLK_MENU:         key = K_MENU;          break;
+			case SDLK_APPLICATION:	key = K_MENU;          break;
 			case SDLK_POWER:        key = K_POWER;         break;
 			case SDLK_UNDO:         key = K_UNDO;          break;
 			case SDLK_SCROLLLOCK:   key = K_SCROLLOCK;     break;
@@ -276,6 +296,15 @@ static keyNum_t IN_TranslateSDLToQ3Key( SDL_Keysym *keysym, qboolean down )
 			case SDLK_CAPSLOCK:     key = K_CAPSLOCK;      break;
 
 			default:
+				if( !( keysym->sym & SDLK_SCANCODE_MASK ) && keysym->scancode <= 95 )
+				{
+					// Map Unicode characters to 95 world keys using the key's scan code.
+					// FIXME: There aren't enough world keys to cover all the scancodes.
+					// Maybe create a map of scancode to quake key at start up and on
+					// key map change; allocate world key numbers as needed similar
+					// to SDL 1.2.
+					key = K_WORLD_0 + (int)keysym->scancode;
+				}
 				break;
 		}
 	}
@@ -324,7 +353,7 @@ static void IN_ActivateMouse( void )
 	if( !mouseActive )
 	{
 		SDL_SetRelativeMouseMode( SDL_TRUE );
-		SDL_SetWindowGrab( SDL_window, 1 );
+		SDL_SetWindowGrab( SDL_window, SDL_TRUE );
 
 		IN_GobbleMotionEvents( );
 	}
@@ -335,9 +364,9 @@ static void IN_ActivateMouse( void )
 		if( in_nograb->modified || !mouseActive )
 		{
 			if( in_nograb->integer )
-				SDL_SetWindowGrab( SDL_window, 0 );
+				SDL_SetWindowGrab( SDL_window, SDL_FALSE );
 			else
-				SDL_SetWindowGrab( SDL_window, 1 );
+				SDL_SetWindowGrab( SDL_window, SDL_TRUE );
 
 			in_nograb->modified = qfalse;
 		}
@@ -368,7 +397,7 @@ static void IN_DeactivateMouse( void )
 	{
 		IN_GobbleMotionEvents( );
 
-		SDL_SetWindowGrab( SDL_window, 0 );
+		SDL_SetWindowGrab( SDL_window, SDL_FALSE );
 		SDL_SetRelativeMouseMode( SDL_FALSE );
 
 		// Don't warp the mouse unless the cursor is within the window
@@ -407,7 +436,7 @@ static int hat_keys[16] = {
 
 struct
 {
-	qboolean buttons[16];  // !!! FIXME: these might be too many.
+	qboolean buttons[SDL_CONTROLLER_BUTTON_MAX + 1]; // +1 because old max was 16, current SDL_CONTROLLER_BUTTON_MAX is 15
 	unsigned int oldaxes;
 	int oldaaxes[MAX_JOYSTICK_AXIS];
 	unsigned int oldhats;
@@ -425,21 +454,40 @@ static void IN_InitJoystick( void )
 	int total = 0;
 	char buf[16384] = "";
 
+	if (gamepad)
+		SDL_GameControllerClose(gamepad);
+
 	if (stick != NULL)
 		SDL_JoystickClose(stick);
 
 	stick = NULL;
+	gamepad = NULL;
 	memset(&stick_state, '\0', sizeof (stick_state));
 
+	// SDL 2.0.4 requires SDL_INIT_JOYSTICK to be initialized separately from
+	// SDL_INIT_GAMECONTROLLER for SDL_JoystickOpen() to work correctly,
+	// despite https://wiki.libsdl.org/SDL_Init (retrieved 2016-08-16)
+	// indicating SDL_INIT_JOYSTICK should be initialized automatically.
 	if (!SDL_WasInit(SDL_INIT_JOYSTICK))
 	{
 		Com_DPrintf("Calling SDL_Init(SDL_INIT_JOYSTICK)...\n");
-		if (SDL_Init(SDL_INIT_JOYSTICK) == -1)
+		if (SDL_Init(SDL_INIT_JOYSTICK) != 0)
 		{
 			Com_DPrintf("SDL_Init(SDL_INIT_JOYSTICK) failed: %s\n", SDL_GetError());
 			return;
 		}
 		Com_DPrintf("SDL_Init(SDL_INIT_JOYSTICK) passed.\n");
+	}
+
+	if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
+	{
+		Com_DPrintf("Calling SDL_Init(SDL_INIT_GAMECONTROLLER)...\n");
+		if (SDL_Init(SDL_INIT_GAMECONTROLLER) != 0)
+		{
+			Com_DPrintf("SDL_Init(SDL_INIT_GAMECONTROLLER) failed: %s\n", SDL_GetError());
+			return;
+		}
+		Com_DPrintf("SDL_Init(SDL_INIT_GAMECONTROLLER) passed.\n");
 	}
 
 	total = SDL_NumJoysticks();
@@ -456,7 +504,7 @@ static void IN_InitJoystick( void )
 
 	if( !in_joystick->integer ) {
 		Com_DPrintf( "Joystick is not active.\n" );
-		SDL_QuitSubSystem(SDL_INIT_JOYSTICK);
+		SDL_QuitSubSystem(SDL_INIT_GAMECONTROLLER);
 		return;
 	}
 
@@ -469,9 +517,12 @@ static void IN_InitJoystick( void )
 	stick = SDL_JoystickOpen( in_joystickNo->integer );
 
 	if (stick == NULL) {
-		Com_DPrintf( "No joystick opened.\n" );
+		Com_DPrintf( "No joystick opened: %s\n", SDL_GetError() );
 		return;
 	}
+
+	if (SDL_IsGameController(in_joystickNo->integer))
+		gamepad = SDL_GameControllerOpen(in_joystickNo->integer);
 
 	Com_DPrintf( "Joystick %d opened\n", in_joystickNo->integer );
 	Com_DPrintf( "Name:       %s\n", SDL_JoystickNameForIndex(in_joystickNo->integer) );
@@ -480,8 +531,10 @@ static void IN_InitJoystick( void )
 	Com_DPrintf( "Buttons:    %d\n", SDL_JoystickNumButtons(stick) );
 	Com_DPrintf( "Balls:      %d\n", SDL_JoystickNumBalls(stick) );
 	Com_DPrintf( "Use Analog: %s\n", in_joystickUseAnalog->integer ? "Yes" : "No" );
+	Com_DPrintf( "Is gamepad: %s\n", gamepad ? "Yes" : "No" );
 
 	SDL_JoystickEventState(SDL_QUERY);
+	SDL_GameControllerEventState(SDL_QUERY);
 }
 
 /*
@@ -491,8 +544,17 @@ IN_ShutdownJoystick
 */
 static void IN_ShutdownJoystick( void )
 {
+	if ( !SDL_WasInit( SDL_INIT_GAMECONTROLLER ) )
+		return;
+
 	if ( !SDL_WasInit( SDL_INIT_JOYSTICK ) )
 		return;
+
+	if (gamepad)
+	{
+		SDL_GameControllerClose(gamepad);
+		gamepad = NULL;
+	}
 
 	if (stick)
 	{
@@ -500,8 +562,207 @@ static void IN_ShutdownJoystick( void )
 		stick = NULL;
 	}
 
+	SDL_QuitSubSystem(SDL_INIT_GAMECONTROLLER);
 	SDL_QuitSubSystem(SDL_INIT_JOYSTICK);
 }
+
+
+static qboolean KeyToAxisAndSign(int keynum, int *outAxis, int *outSign)
+{
+	char *bind;
+
+	if (!keynum)
+		return qfalse;
+
+	bind = Key_GetBinding(keynum);
+
+	if (!bind || *bind != '+')
+		return qfalse;
+
+	*outSign = 0;
+
+	if (Q_stricmp(bind, "+forward") == 0)
+	{
+		*outAxis = j_forward_axis->integer;
+		*outSign = j_forward->value > 0.0f ? 1 : -1;
+	}
+	else if (Q_stricmp(bind, "+back") == 0)
+	{
+		*outAxis = j_forward_axis->integer;
+		*outSign = j_forward->value > 0.0f ? -1 : 1;
+	}
+	else if (Q_stricmp(bind, "+moveleft") == 0)
+	{
+		*outAxis = j_side_axis->integer;
+		*outSign = j_side->value > 0.0f ? -1 : 1;
+	}
+	else if (Q_stricmp(bind, "+moveright") == 0)
+	{
+		*outAxis = j_side_axis->integer;
+		*outSign = j_side->value > 0.0f ? 1 : -1;
+	}
+	else if (Q_stricmp(bind, "+lookup") == 0)
+	{
+		*outAxis = j_pitch_axis->integer;
+		*outSign = j_pitch->value > 0.0f ? -1 : 1;
+	}
+	else if (Q_stricmp(bind, "+lookdown") == 0)
+	{
+		*outAxis = j_pitch_axis->integer;
+		*outSign = j_pitch->value > 0.0f ? 1 : -1;
+	}
+	else if (Q_stricmp(bind, "+left") == 0)
+	{
+		*outAxis = j_yaw_axis->integer;
+		*outSign = j_yaw->value > 0.0f ? 1 : -1;
+	}
+	else if (Q_stricmp(bind, "+right") == 0)
+	{
+		*outAxis = j_yaw_axis->integer;
+		*outSign = j_yaw->value > 0.0f ? -1 : 1;
+	}
+	else if (Q_stricmp(bind, "+moveup") == 0)
+	{
+		*outAxis = j_up_axis->integer;
+		*outSign = j_up->value > 0.0f ? 1 : -1;
+	}
+	else if (Q_stricmp(bind, "+movedown") == 0)
+	{
+		*outAxis = j_up_axis->integer;
+		*outSign = j_up->value > 0.0f ? -1 : 1;
+	}
+
+	return *outSign != 0;
+}
+
+/*
+===============
+IN_GamepadMove
+===============
+*/
+static void IN_GamepadMove( void )
+{
+	int i;
+	int translatedAxes[MAX_JOYSTICK_AXIS];
+	qboolean translatedAxesSet[MAX_JOYSTICK_AXIS];
+
+	SDL_GameControllerUpdate();
+
+	// check buttons
+	for (i = 0; i < SDL_CONTROLLER_BUTTON_MAX; i++)
+	{
+		qboolean pressed = SDL_GameControllerGetButton(gamepad, SDL_CONTROLLER_BUTTON_A + i);
+		if (pressed != stick_state.buttons[i])
+		{
+			Com_QueueEvent(in_eventTime, SE_KEY, K_PAD0_A + i, pressed, 0, NULL);
+			stick_state.buttons[i] = pressed;
+		}
+	}
+
+	// must defer translated axes until all real axes are processed
+	// must be done this way to prevent a later mapped axis from zeroing out a previous one
+	if (in_joystickUseAnalog->integer)
+	{
+		for (i = 0; i < MAX_JOYSTICK_AXIS; i++)
+		{
+			translatedAxes[i] = 0;
+			translatedAxesSet[i] = qfalse;
+		}
+	}
+
+	// check axes
+	for (i = 0; i < SDL_CONTROLLER_AXIS_MAX; i++)
+	{
+		int axis = SDL_GameControllerGetAxis(gamepad, SDL_CONTROLLER_AXIS_LEFTX + i);
+		int oldAxis = stick_state.oldaaxes[i];
+
+		// Smoothly ramp from dead zone to maximum value
+		float f = ((float)abs(axis) / 32767.0f - in_joystickThreshold->value) / (1.0f - in_joystickThreshold->value);
+
+		if (f < 0.0f)
+			f = 0.0f;
+
+		axis = (int)(32767 * ((axis < 0) ? -f : f));
+
+		if (axis != oldAxis)
+		{
+			const int negMap[SDL_CONTROLLER_AXIS_MAX] = { K_PAD0_LEFTSTICK_LEFT,  K_PAD0_LEFTSTICK_UP,   K_PAD0_RIGHTSTICK_LEFT,  K_PAD0_RIGHTSTICK_UP, 0, 0 };
+			const int posMap[SDL_CONTROLLER_AXIS_MAX] = { K_PAD0_LEFTSTICK_RIGHT, K_PAD0_LEFTSTICK_DOWN, K_PAD0_RIGHTSTICK_RIGHT, K_PAD0_RIGHTSTICK_DOWN, K_PAD0_LEFTTRIGGER, K_PAD0_RIGHTTRIGGER };
+
+			qboolean posAnalog = qfalse, negAnalog = qfalse;
+			int negKey = negMap[i];
+			int posKey = posMap[i];
+
+			if (in_joystickUseAnalog->integer)
+			{
+				int posAxis = 0, posSign = 0, negAxis = 0, negSign = 0;
+
+				// get axes and axes signs for keys if available
+				posAnalog = KeyToAxisAndSign(posKey, &posAxis, &posSign);
+				negAnalog = KeyToAxisAndSign(negKey, &negAxis, &negSign);
+
+				// positive to negative/neutral -> keyup if axis hasn't yet been set
+				if (posAnalog && !translatedAxesSet[posAxis] && oldAxis > 0 && axis <= 0)
+				{
+					translatedAxes[posAxis] = 0;
+					translatedAxesSet[posAxis] = qtrue;
+				}
+
+				// negative to positive/neutral -> keyup if axis hasn't yet been set
+				if (negAnalog && !translatedAxesSet[negAxis] && oldAxis < 0 && axis >= 0)
+				{
+					translatedAxes[negAxis] = 0;
+					translatedAxesSet[negAxis] = qtrue;
+				}
+
+				// negative/neutral to positive -> keydown
+				if (posAnalog && axis > 0)
+				{
+					translatedAxes[posAxis] = axis * posSign;
+					translatedAxesSet[posAxis] = qtrue;
+				}
+
+				// positive/neutral to negative -> keydown
+				if (negAnalog && axis < 0)
+				{
+					translatedAxes[negAxis] = -axis * negSign;
+					translatedAxesSet[negAxis] = qtrue;
+				}
+			}
+
+			// keyups first so they get overridden by keydowns later
+
+			// positive to negative/neutral -> keyup
+			if (!posAnalog && posKey && oldAxis > 0 && axis <= 0)
+				Com_QueueEvent(in_eventTime, SE_KEY, posKey, qfalse, 0, NULL);
+
+			// negative to positive/neutral -> keyup
+			if (!negAnalog && negKey && oldAxis < 0 && axis >= 0)
+				Com_QueueEvent(in_eventTime, SE_KEY, negKey, qfalse, 0, NULL);
+
+			// negative/neutral to positive -> keydown
+			if (!posAnalog && posKey && oldAxis <= 0 && axis > 0)
+				Com_QueueEvent(in_eventTime, SE_KEY, posKey, qtrue, 0, NULL);
+
+			// positive/neutral to negative -> keydown
+			if (!negAnalog && negKey && oldAxis >= 0 && axis < 0)
+				Com_QueueEvent(in_eventTime, SE_KEY, negKey, qtrue, 0, NULL);
+
+			stick_state.oldaaxes[i] = axis;
+		}
+	}
+
+	// set translated axes
+	if (in_joystickUseAnalog->integer)
+	{
+		for (i = 0; i < MAX_JOYSTICK_AXIS; i++)
+		{
+			if (translatedAxesSet[i])
+				Com_QueueEvent(in_eventTime, SE_JOYSTICK_AXIS, i, translatedAxes[i], 0, NULL);
+		}
+	}
+}
+
 
 /*
 ===============
@@ -514,6 +775,12 @@ static void IN_JoyMove( void )
 	unsigned int hats = 0;
 	int total = 0;
 	int i = 0;
+
+	if (gamepad)
+	{
+		IN_GamepadMove();
+		return;
+	}
 
 	if (!stick)
 		return;
@@ -542,7 +809,7 @@ static void IN_JoyMove( void )
 				balldx *= 2;
 			if (abs(balldy) > 1)
 				balldy *= 2;
-			Com_QueueEvent( 0, SE_MOUSE, balldx, balldy, 0, NULL );
+			Com_QueueEvent( in_eventTime, SE_MOUSE, balldx, balldy, 0, NULL );
 		}
 	}
 
@@ -557,7 +824,7 @@ static void IN_JoyMove( void )
 			qboolean pressed = (SDL_JoystickGetButton(stick, i) != 0);
 			if (pressed != stick_state.buttons[i])
 			{
-				Com_QueueEvent( 0, SE_KEY, K_JOY1 + i, pressed, 0, NULL );
+				Com_QueueEvent( in_eventTime, SE_KEY, K_JOY1 + i, pressed, 0, NULL );
 				stick_state.buttons[i] = pressed;
 			}
 		}
@@ -582,32 +849,32 @@ static void IN_JoyMove( void )
 				// release event
 				switch( ((Uint8 *)&stick_state.oldhats)[i] ) {
 					case SDL_HAT_UP:
-						Com_QueueEvent( 0, SE_KEY, hat_keys[4*i + 0], qfalse, 0, NULL );
+						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 0], qfalse, 0, NULL );
 						break;
 					case SDL_HAT_RIGHT:
-						Com_QueueEvent( 0, SE_KEY, hat_keys[4*i + 1], qfalse, 0, NULL );
+						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 1], qfalse, 0, NULL );
 						break;
 					case SDL_HAT_DOWN:
-						Com_QueueEvent( 0, SE_KEY, hat_keys[4*i + 2], qfalse, 0, NULL );
+						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 2], qfalse, 0, NULL );
 						break;
 					case SDL_HAT_LEFT:
-						Com_QueueEvent( 0, SE_KEY, hat_keys[4*i + 3], qfalse, 0, NULL );
+						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 3], qfalse, 0, NULL );
 						break;
 					case SDL_HAT_RIGHTUP:
-						Com_QueueEvent( 0, SE_KEY, hat_keys[4*i + 0], qfalse, 0, NULL );
-						Com_QueueEvent( 0, SE_KEY, hat_keys[4*i + 1], qfalse, 0, NULL );
+						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 0], qfalse, 0, NULL );
+						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 1], qfalse, 0, NULL );
 						break;
 					case SDL_HAT_RIGHTDOWN:
-						Com_QueueEvent( 0, SE_KEY, hat_keys[4*i + 2], qfalse, 0, NULL );
-						Com_QueueEvent( 0, SE_KEY, hat_keys[4*i + 1], qfalse, 0, NULL );
+						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 2], qfalse, 0, NULL );
+						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 1], qfalse, 0, NULL );
 						break;
 					case SDL_HAT_LEFTUP:
-						Com_QueueEvent( 0, SE_KEY, hat_keys[4*i + 0], qfalse, 0, NULL );
-						Com_QueueEvent( 0, SE_KEY, hat_keys[4*i + 3], qfalse, 0, NULL );
+						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 0], qfalse, 0, NULL );
+						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 3], qfalse, 0, NULL );
 						break;
 					case SDL_HAT_LEFTDOWN:
-						Com_QueueEvent( 0, SE_KEY, hat_keys[4*i + 2], qfalse, 0, NULL );
-						Com_QueueEvent( 0, SE_KEY, hat_keys[4*i + 3], qfalse, 0, NULL );
+						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 2], qfalse, 0, NULL );
+						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 3], qfalse, 0, NULL );
 						break;
 					default:
 						break;
@@ -615,32 +882,32 @@ static void IN_JoyMove( void )
 				// press event
 				switch( ((Uint8 *)&hats)[i] ) {
 					case SDL_HAT_UP:
-						Com_QueueEvent( 0, SE_KEY, hat_keys[4*i + 0], qtrue, 0, NULL );
+						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 0], qtrue, 0, NULL );
 						break;
 					case SDL_HAT_RIGHT:
-						Com_QueueEvent( 0, SE_KEY, hat_keys[4*i + 1], qtrue, 0, NULL );
+						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 1], qtrue, 0, NULL );
 						break;
 					case SDL_HAT_DOWN:
-						Com_QueueEvent( 0, SE_KEY, hat_keys[4*i + 2], qtrue, 0, NULL );
+						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 2], qtrue, 0, NULL );
 						break;
 					case SDL_HAT_LEFT:
-						Com_QueueEvent( 0, SE_KEY, hat_keys[4*i + 3], qtrue, 0, NULL );
+						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 3], qtrue, 0, NULL );
 						break;
 					case SDL_HAT_RIGHTUP:
-						Com_QueueEvent( 0, SE_KEY, hat_keys[4*i + 0], qtrue, 0, NULL );
-						Com_QueueEvent( 0, SE_KEY, hat_keys[4*i + 1], qtrue, 0, NULL );
+						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 0], qtrue, 0, NULL );
+						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 1], qtrue, 0, NULL );
 						break;
 					case SDL_HAT_RIGHTDOWN:
-						Com_QueueEvent( 0, SE_KEY, hat_keys[4*i + 2], qtrue, 0, NULL );
-						Com_QueueEvent( 0, SE_KEY, hat_keys[4*i + 1], qtrue, 0, NULL );
+						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 2], qtrue, 0, NULL );
+						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 1], qtrue, 0, NULL );
 						break;
 					case SDL_HAT_LEFTUP:
-						Com_QueueEvent( 0, SE_KEY, hat_keys[4*i + 0], qtrue, 0, NULL );
-						Com_QueueEvent( 0, SE_KEY, hat_keys[4*i + 3], qtrue, 0, NULL );
+						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 0], qtrue, 0, NULL );
+						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 3], qtrue, 0, NULL );
 						break;
 					case SDL_HAT_LEFTDOWN:
-						Com_QueueEvent( 0, SE_KEY, hat_keys[4*i + 2], qtrue, 0, NULL );
-						Com_QueueEvent( 0, SE_KEY, hat_keys[4*i + 3], qtrue, 0, NULL );
+						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 2], qtrue, 0, NULL );
+						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 3], qtrue, 0, NULL );
 						break;
 					default:
 						break;
@@ -668,7 +935,7 @@ static void IN_JoyMove( void )
 
 				if ( axis != stick_state.oldaaxes[i] )
 				{
-					Com_QueueEvent( 0, SE_JOYSTICK_AXIS, i, axis, 0, NULL );
+					Com_QueueEvent( in_eventTime, SE_JOYSTICK_AXIS, i, axis, 0, NULL );
 					stick_state.oldaaxes[i] = axis;
 				}
 			}
@@ -694,11 +961,11 @@ static void IN_JoyMove( void )
 	{
 		for( i = 0; i < 16; i++ ) {
 			if( ( axes & ( 1 << i ) ) && !( stick_state.oldaxes & ( 1 << i ) ) ) {
-				Com_QueueEvent( 0, SE_KEY, joy_keys[i], qtrue, 0, NULL );
+				Com_QueueEvent( in_eventTime, SE_KEY, joy_keys[i], qtrue, 0, NULL );
 			}
 
 			if( !( axes & ( 1 << i ) ) && ( stick_state.oldaxes & ( 1 << i ) ) ) {
-				Com_QueueEvent( 0, SE_KEY, joy_keys[i], qfalse, 0, NULL );
+				Com_QueueEvent( in_eventTime, SE_KEY, joy_keys[i], qfalse, 0, NULL );
 			}
 		}
 	}
@@ -730,19 +997,19 @@ static void IN_ProcessEvents( void )
 					break;
 
 				if( ( key = IN_TranslateSDLToQ3Key( &e.key.keysym, qtrue ) ) )
-					Com_QueueEvent( 0, SE_KEY, key, qtrue, 0, NULL );
+					Com_QueueEvent( in_eventTime, SE_KEY, key, qtrue, 0, NULL );
 
 				if( key == K_BACKSPACE )
-					Com_QueueEvent( 0, SE_CHAR, CTRL('h'), 0, 0, NULL );
+					Com_QueueEvent( in_eventTime, SE_CHAR, CTRL('h'), 0, 0, NULL );
 				else if( keys[K_CTRL].down && key >= 'a' && key <= 'z' )
-					Com_QueueEvent( 0, SE_CHAR, CTRL(key), 0, 0, NULL );
+					Com_QueueEvent( in_eventTime, SE_CHAR, CTRL(key), 0, 0, NULL );
 
 				lastKeyDown = key;
 				break;
 
 			case SDL_KEYUP:
 				if( ( key = IN_TranslateSDLToQ3Key( &e.key.keysym, qfalse ) ) )
-					Com_QueueEvent( 0, SE_KEY, key, qfalse, 0, NULL );
+					Com_QueueEvent( in_eventTime, SE_KEY, key, qfalse, 0, NULL );
 
 				lastKeyDown = 0;
 				break;
@@ -773,7 +1040,7 @@ static void IN_ProcessEvents( void )
 						else if( ( *c & 0xF8 ) == 0xF0 ) // 1111 0xxx
 						{
 							utf32 |= ( *c++ & 0x07 ) << 18;
-							utf32 |= ( *c++ & 0x3F ) << 6;
+							utf32 |= ( *c++ & 0x3F ) << 12;
 							utf32 |= ( *c++ & 0x3F ) << 6;
 							utf32 |= ( *c++ & 0x3F );
 						}
@@ -787,11 +1054,11 @@ static void IN_ProcessEvents( void )
 						{
 							if( IN_IsConsoleKey( 0, utf32 ) )
 							{
-								Com_QueueEvent( 0, SE_KEY, K_CONSOLE, qtrue, 0, NULL );
-								Com_QueueEvent( 0, SE_KEY, K_CONSOLE, qfalse, 0, NULL );
+								Com_QueueEvent( in_eventTime, SE_KEY, K_CONSOLE, qtrue, 0, NULL );
+								Com_QueueEvent( in_eventTime, SE_KEY, K_CONSOLE, qfalse, 0, NULL );
 							}
 							else
-								Com_QueueEvent( 0, SE_CHAR, utf32, 0, 0, NULL );
+								Com_QueueEvent( in_eventTime, SE_CHAR, utf32, 0, 0, NULL );
 						}
           }
         }
@@ -799,7 +1066,11 @@ static void IN_ProcessEvents( void )
 
 			case SDL_MOUSEMOTION:
 				if( mouseActive )
-					Com_QueueEvent( 0, SE_MOUSE, e.motion.xrel, e.motion.yrel, 0, NULL );
+				{
+					if( !e.motion.xrel && !e.motion.yrel )
+						break;
+					Com_QueueEvent( in_eventTime, SE_MOUSE, e.motion.xrel, e.motion.yrel, 0, NULL );
+				}
 				break;
 
 			case SDL_MOUSEBUTTONDOWN:
@@ -817,7 +1088,7 @@ static void IN_ProcessEvents( void )
 					}
 					mouse_button_click_x = e.button.x;
 					mouse_button_click_y = e.button.y;
-					Com_QueueEvent( 0, SE_KEY, b,
+					Com_QueueEvent( in_eventTime, SE_KEY, b,
 						( e.type == SDL_MOUSEBUTTONDOWN ? qtrue : qfalse ), 0, NULL );
 				}
 				break;
@@ -825,14 +1096,20 @@ static void IN_ProcessEvents( void )
 			case SDL_MOUSEWHEEL:
 				if( e.wheel.y > 0 )
 				{
-					Com_QueueEvent( 0, SE_KEY, K_MWHEELUP, qtrue, 0, NULL );
-					Com_QueueEvent( 0, SE_KEY, K_MWHEELUP, qfalse, 0, NULL );
+					Com_QueueEvent( in_eventTime, SE_KEY, K_MWHEELUP, qtrue, 0, NULL );
+					Com_QueueEvent( in_eventTime, SE_KEY, K_MWHEELUP, qfalse, 0, NULL );
 				}
-				else
+				else if( e.wheel.y < 0 )
 				{
-					Com_QueueEvent( 0, SE_KEY, K_MWHEELDOWN, qtrue, 0, NULL );
-					Com_QueueEvent( 0, SE_KEY, K_MWHEELDOWN, qfalse, 0, NULL );
+					Com_QueueEvent( in_eventTime, SE_KEY, K_MWHEELDOWN, qtrue, 0, NULL );
+					Com_QueueEvent( in_eventTime, SE_KEY, K_MWHEELDOWN, qfalse, 0, NULL );
 				}
+				break;
+
+			case SDL_CONTROLLERDEVICEADDED:
+			case SDL_CONTROLLERDEVICEREMOVED:
+				if (in_joystick->integer)
+					IN_InitJoystick();
 				break;
 
 			case SDL_QUIT:
@@ -844,11 +1121,19 @@ static void IN_ProcessEvents( void )
 				{
 					case SDL_WINDOWEVENT_RESIZED:
 						{
-							char width[32], height[32];
-							Com_sprintf( width, sizeof( width ), "%d", e.window.data1 );
-							Com_sprintf( height, sizeof( height ), "%d", e.window.data2 );
-							Cvar_Set( "r_customwidth", width );
-							Cvar_Set( "r_customheight", height );
+							int width, height;
+
+							width = e.window.data1;
+							height = e.window.data2;
+
+							// check if size actually changed
+							if( cls.glconfig.vidWidth == width && cls.glconfig.vidHeight == height )
+							{
+								break;
+							}
+
+							Cvar_SetValue( "r_customwidth", width );
+							Cvar_SetValue( "r_customheight", height );
 							Cvar_Set( "r_mode", "-1" );
 
 							// Wait until user stops dragging for 1 second, so
@@ -882,7 +1167,6 @@ void IN_Frame( void )
 	qboolean loading;
 
 	IN_JoyMove( );
-	IN_ProcessEvents( );
 
 	// If not DISCONNECTED (main menu) or ACTIVE (in game), we're loading
 	loading = ( clc.state != CA_DISCONNECTED && clc.state != CA_ACTIVE );
@@ -909,6 +1193,11 @@ void IN_Frame( void )
 	}
 	else
 		IN_ActivateMouse( );
+
+	IN_ProcessEvents( );
+
+	// Set event time for next frame to earliest possible time an event could happen
+	in_eventTime = Sys_Milliseconds( );
 
 	// In case we had to delay actual restart of video system
 	if( ( vidRestartTime != 0 ) && ( vidRestartTime < Sys_Milliseconds( ) ) )
